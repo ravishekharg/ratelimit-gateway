@@ -1,0 +1,110 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + unit/property tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest -q
+
+  compose:
+    name: integration + load test (3 Redis shards, 2 gateway replicas)
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - run: docker compose up -d --build --wait
+      - run: python scripts/loadtest.py --requests 5000 --concurrency 50 --out results.json
+      - name: summary
+        if: always()
+        run: python scripts/summary.py results.json "Docker Compose" >> "$GITHUB_STEP_SUMMARY"
+      - if: failure()
+        run: docker compose logs --tail 100
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: compose-results, path: results.json }
+
+  kind:
+    name: deploy to Kubernetes (kind) + exactness across pods
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - name: kind cluster
+        run: |
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64 && chmod +x kind
+          printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes: [{role: control-plane}, {role: worker}, {role: worker}]\n' > kind.yaml
+          ./kind create cluster --config kind.yaml --wait 120s
+      - name: build and load image
+        run: |
+          docker build -t ghcr.io/ravishekharg/ratelimit-gateway:0.1.0 .
+          ./kind load docker-image ghcr.io/ravishekharg/ratelimit-gateway:0.1.0
+      - name: deploy
+        run: |
+          kubectl apply -f deploy/k8s/ratelimit.yaml
+          kubectl -n ratelimit patch configmap gateway-config --type merge -p \
+            '{"data":{"PLANS":"{\"burst\":{\"algo\":\"token_bucket\",\"capacity\":50,\"rate\":0.01},\"window\":{\"algo\":\"sliding_window\",\"limit\":30,\"window\":60},\"free\":{\"algo\":\"token_bucket\",\"capacity\":10,\"rate\":1},\"perf\":{\"algo\":\"token_bucket\",\"capacity\":1000000,\"rate\":1000000}}"}}'
+          kubectl -n ratelimit rollout status sts/redis --timeout=180s
+          kubectl -n ratelimit rollout restart deploy/gateway
+          kubectl -n ratelimit rollout status deploy/gateway --timeout=180s
+          kubectl -n ratelimit get pods -o wide
+      - name: exactness across the 3 gateway pods
+        run: |
+          # port-forward to a Service pins one pod, so forward each gateway pod on its own port
+          port=8091; gws=""
+          for pod in $(kubectl -n ratelimit get pods -l app=gateway -o name); do
+            kubectl -n ratelimit port-forward "$pod" "$port:8080" >/dev/null 2>&1 &
+            gws="$gws,http://localhost:$port"; port=$((port + 1))
+          done
+          kubectl -n ratelimit port-forward pod/redis-0 6379:6379 >/dev/null 2>&1 &
+          kubectl -n ratelimit port-forward pod/redis-1 6380:6379 >/dev/null 2>&1 &
+          kubectl -n ratelimit port-forward pod/redis-2 6381:6379 >/dev/null 2>&1 &
+          kubectl -n ratelimit port-forward svc/upstream 5678:5678 >/dev/null 2>&1 &
+          sleep 5
+          python scripts/loadtest.py --gateways "${gws#,}" --requests 1000 --concurrency 20 --out k8s-results.json
+      - name: summary
+        if: always()
+        run: python scripts/summary.py k8s-results.json "Kubernetes (kind, 3 gateway pods, 3 Redis shards)" >> "$GITHUB_STEP_SUMMARY"
+      - if: failure()
+        run: kubectl -n ratelimit logs deploy/gateway --tail 100 --all-containers
+
+  iac:
+    name: terraform + manifests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "1.9.8" }
+      - working-directory: terraform/aws
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+      - run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary deploy/k8s/ratelimit.yaml

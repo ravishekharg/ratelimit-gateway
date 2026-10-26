@@ -1,0 +1,146 @@
+# Gateway (3+ replicas, HPA) in front of 3 independent Redis shards (StatefulSet, one shard per pod).
+# On AWS, replace the StatefulSet with the ElastiCache shards from terraform/aws and point REDIS_URLS at them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ratelimit
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: ratelimit
+data:
+  UPSTREAM_URL: http://upstream.ratelimit.svc:5678
+  REDIS_URLS: redis://redis-0.redis.ratelimit.svc:6379,redis://redis-1.redis.ratelimit.svc:6379,redis://redis-2.redis.ratelimit.svc:6379
+  PLANS: |
+    {"free": {"algo": "token_bucket", "capacity": 10, "rate": 1},
+     "pro": {"algo": "sliding_window", "limit": 600, "window": 60},
+     "burst": {"algo": "token_bucket", "capacity": 50, "rate": 0.01}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ratelimit
+spec:
+  clusterIP: None                       # headless: stable DNS per shard (redis-0.redis...)
+  selector: { app: redis }
+  ports: [{ name: redis, port: 6379 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: ratelimit
+spec:
+  serviceName: redis
+  replicas: 3
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "200mb", "--maxmemory-policy", "volatile-ttl"]
+          ports: [{ containerPort: 6379, name: redis }]
+          readinessProbe: { exec: { command: ["redis-cli", "ping"] }, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upstream
+  namespace: ratelimit
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: upstream } }
+  template:
+    metadata: { labels: { app: upstream } }
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0
+          args: ["-text", "ok from upstream", "-listen", ":5678"]
+          ports: [{ containerPort: 5678 }]
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: upstream
+  namespace: ratelimit
+spec:
+  selector: { app: upstream }
+  ports: [{ port: 5678, targetPort: 5678 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: ratelimit
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: gateway } }
+  template:
+    metadata:
+      labels: { app: gateway }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "8080", prometheus.io/path: /metrics }
+    spec:
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: gateway } }
+      containers:
+        - name: gateway
+          image: ghcr.io/ravishekharg/ratelimit-gateway:0.1.0
+          envFrom: [{ configMapRef: { name: gateway-config } }]
+          ports: [{ containerPort: 8080, name: http }]
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 5 }
+          livenessProbe: { tcpSocket: { port: http }, periodSeconds: 10 }
+          lifecycle: { preStop: { exec: { command: ["sleep", "5"] } } }
+          resources:
+            requests: { cpu: 200m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: ratelimit
+spec:
+  selector: { app: gateway }
+  ports: [{ port: 80, targetPort: http }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: ratelimit
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: gateway }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: ratelimit
+spec:
+  minAvailable: 2
+  selector: { matchLabels: { app: gateway } }

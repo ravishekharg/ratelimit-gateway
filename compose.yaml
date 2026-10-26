@@ -1,0 +1,45 @@
+# Local / CI stack: 3 independent Redis shards, 2 gateway replicas sharing them, and an upstream service.
+name: rlg
+
+x-plans: &plans >-
+  {"free": {"algo": "token_bucket", "capacity": 10, "rate": 1},
+   "pro": {"algo": "sliding_window", "limit": 600, "window": 60},
+   "burst": {"algo": "token_bucket", "capacity": 50, "rate": 0.01},
+   "window": {"algo": "sliding_window", "limit": 30, "window": 60},
+   "perf": {"algo": "token_bucket", "capacity": 1000000, "rate": 1000000}}
+
+x-gateway: &gateway
+  build: .
+  image: rlg:local
+  environment:
+    UPSTREAM_URL: http://upstream:5678
+    REDIS_URLS: redis://redis-0:6379,redis://redis-1:6379,redis://redis-2:6379
+    PLANS: *plans
+  depends_on:
+    redis-0: { condition: service_healthy }
+    redis-1: { condition: service_healthy }
+    redis-2: { condition: service_healthy }
+    upstream: { condition: service_started }
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+    interval: 3s
+    retries: 20
+
+x-redis: &redis
+  image: redis:7.4-alpine
+  command: ["redis-server", "--save", "", "--appendonly", "no"]
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 2s
+    retries: 20
+
+services:
+  redis-0: { <<: *redis, ports: ["6379:6379"] }
+  redis-1: { <<: *redis, ports: ["6380:6379"] }
+  redis-2: { <<: *redis, ports: ["6381:6379"] }
+  upstream:
+    image: hashicorp/http-echo:1.0
+    command: ["-text", "ok from upstream", "-listen", ":5678"]
+    ports: ["5678:5678"]
+  gw1: { <<: *gateway, ports: ["8081:8080"] }
+  gw2: { <<: *gateway, ports: ["8082:8080"] }
