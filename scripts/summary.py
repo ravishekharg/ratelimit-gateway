@@ -24,4 +24,5 @@ print(f"- Shard balance (1,000 keys): {r['shard_balance']['keys_per_shard']} "
       f"(max/mean {r['shard_balance']['max_over_mean']})\n")
 print("| path | requests | conc. | req/s | p50 ms | p95 ms | p99 ms |\n|---|---|---|---|---|---|---|")
 for name, x in (("direct to upstream", d), ("through gateway", g)):
-    print(f"| {name} | {x['requests']} | {x['concurrency']} | {x['rps']} | {x['p50_ms']} | {x['p95_ms']} | {x['p99_ms']} |")
+    cells = [name, x["requests"], x["concurrency"], x["rps"], x["p50_ms"], x["p95_ms"], x["p99_ms"]]
+    print("| " + " | ".join(map(str, cells)) + " |")
