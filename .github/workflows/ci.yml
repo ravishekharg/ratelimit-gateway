@@ -67,7 +67,7 @@ jobs:
         run: |
           kubectl apply -f deploy/k8s/ratelimit.yaml
           kubectl -n ratelimit patch configmap gateway-config --type merge -p \
-            '{"data":{"PLANS":"{\"burst\":{\"algo\":\"token_bucket\",\"capacity\":50,\"rate\":0.01},\"window\":{\"algo\":\"sliding_window\",\"limit\":30,\"window\":60},\"free\":{\"algo\":\"token_bucket\",\"capacity\":10,\"rate\":1},\"perf\":{\"algo\":\"token_bucket\",\"capacity\":1000000,\"rate\":1000000}}"}}'
+            '{"data":{"PLANS":"{\"burst\":{\"algo\":\"token_bucket\",\"capacity\":50,\"rate\":0.01},\"window\":{\"algo\":\"sliding_window\",\"limit\":30,\"window\":60},\"free\":{\"algo\":\"token_bucket\",\"capacity\":10,\"rate\":1},\"perf\":{\"algo\":\"token_bucket\",\"capacity\":1000000,\"rate\":1000}}"}}'
           kubectl -n ratelimit rollout status sts/redis --timeout=180s
           kubectl -n ratelimit rollout restart deploy/gateway
           kubectl -n ratelimit rollout status deploy/gateway --timeout=180s
