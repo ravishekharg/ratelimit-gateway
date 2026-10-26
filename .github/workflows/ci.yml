@@ -72,30 +72,45 @@ jobs:
           kubectl -n ratelimit rollout restart deploy/gateway
           kubectl -n ratelimit rollout status deploy/gateway --timeout=180s
           kubectl -n ratelimit get pods -o wide
-      - name: exactness across the 3 gateway pods
+      - name: exactness across the 3 gateway pods (load test runs in-cluster as a Job)
         run: |
-          # port-forward to a Service pins one pod, so forward each gateway pod on its own port
-          # only Ready pods that are not terminating (old pods from the rollout restart may still be listed)
-          pods=$(kubectl -n ratelimit get pods -l app=gateway -o json | python -c "
+          # address each Ready, non-terminating gateway pod directly (a Service would hide which pod answers)
+          ips=$(kubectl -n ratelimit get pods -l app=gateway -o json | python -c "
           import json, sys
           for p in json.load(sys.stdin)['items']:
               ready = any(c['type'] == 'Ready' and c['status'] == 'True' for c in p['status'].get('conditions', []))
               if ready and not p['metadata'].get('deletionTimestamp'):
-                  print(p['metadata']['name'])")
-          echo "gateway pods: $pods"
-          port=8091; gws=""
-          for pod in $pods; do
-            kubectl -n ratelimit port-forward "pod/$pod" "$port:8080" >/dev/null 2>&1 &
-            gws="$gws,http://localhost:$port"; port=$((port + 1))
-          done
-          kubectl -n ratelimit port-forward pod/redis-0 6379:6379 >/dev/null 2>&1 &
-          kubectl -n ratelimit port-forward pod/redis-1 6380:6379 >/dev/null 2>&1 &
-          kubectl -n ratelimit port-forward pod/redis-2 6381:6379 >/dev/null 2>&1 &
-          kubectl -n ratelimit port-forward svc/upstream 5678:5678 >/dev/null 2>&1 &
-          for url in ${gws//,/ } http://localhost:5678; do
-            for i in $(seq 1 30); do curl -sf -o /dev/null "$url/healthz" || curl -sf -o /dev/null "$url/" && break; sleep 1; done
-          done
-          python scripts/loadtest.py --gateways "${gws#,}" --requests 1000 --concurrency 20 --out k8s-results.json
+                  print(p['status']['podIP'])")
+          gws=$(for ip in $ips; do printf 'http://%s:8080,' "$ip"; done); gws=${gws%,}
+          echo "gateways: $gws"
+          kubectl -n ratelimit create configmap loadtest --from-file=scripts/loadtest.py
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: { name: loadtest, namespace: ratelimit }
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: loadtest
+                    image: ghcr.io/ravishekharg/ratelimit-gateway:0.1.0
+                    command: ["python", "/scripts/loadtest.py", "--gateways", "$gws",
+                              "--redis", "redis://redis-0.redis:6379,redis://redis-1.redis:6379,redis://redis-2.redis:6379",
+                              "--upstream", "http://upstream:5678", "--requests", "3000", "--concurrency", "50",
+                              "--out", "/tmp/results.json"]
+                    volumeMounts: [{ name: scripts, mountPath: /scripts }]
+                volumes: [{ name: scripts, configMap: { name: loadtest } }]
+          EOF
+          kubectl -n ratelimit wait --for=condition=complete job/loadtest --timeout=300s || true
+          kubectl -n ratelimit logs job/loadtest | tee loadtest.log
+          python - <<'PY'
+          import json
+          text = open("loadtest.log").read()
+          json.dump(json.loads(text[text.index("{"):]), open("k8s-results.json", "w"), indent=2)
+          PY
+          python -c "import json, sys; sys.exit(0 if json.load(open('k8s-results.json'))['passed'] else 1)"
       - name: summary
         if: always()
         run: python scripts/summary.py k8s-results.json "Kubernetes (kind, 3 gateway pods, 3 Redis shards)" >> "$GITHUB_STEP_SUMMARY"
