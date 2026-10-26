@@ -75,16 +75,26 @@ jobs:
       - name: exactness across the 3 gateway pods
         run: |
           # port-forward to a Service pins one pod, so forward each gateway pod on its own port
+          # only Ready pods that are not terminating (old pods from the rollout restart may still be listed)
+          pods=$(kubectl -n ratelimit get pods -l app=gateway -o json | python -c "
+          import json, sys
+          for p in json.load(sys.stdin)['items']:
+              ready = any(c['type'] == 'Ready' and c['status'] == 'True' for c in p['status'].get('conditions', []))
+              if ready and not p['metadata'].get('deletionTimestamp'):
+                  print(p['metadata']['name'])")
+          echo "gateway pods: $pods"
           port=8091; gws=""
-          for pod in $(kubectl -n ratelimit get pods -l app=gateway -o name); do
-            kubectl -n ratelimit port-forward "$pod" "$port:8080" >/dev/null 2>&1 &
+          for pod in $pods; do
+            kubectl -n ratelimit port-forward "pod/$pod" "$port:8080" >/dev/null 2>&1 &
             gws="$gws,http://localhost:$port"; port=$((port + 1))
           done
           kubectl -n ratelimit port-forward pod/redis-0 6379:6379 >/dev/null 2>&1 &
           kubectl -n ratelimit port-forward pod/redis-1 6380:6379 >/dev/null 2>&1 &
           kubectl -n ratelimit port-forward pod/redis-2 6381:6379 >/dev/null 2>&1 &
           kubectl -n ratelimit port-forward svc/upstream 5678:5678 >/dev/null 2>&1 &
-          sleep 5
+          for url in ${gws//,/ } http://localhost:5678; do
+            for i in $(seq 1 30); do curl -sf -o /dev/null "$url/healthz" || curl -sf -o /dev/null "$url/" && break; sleep 1; done
+          done
           python scripts/loadtest.py --gateways "${gws#,}" --requests 1000 --concurrency 20 --out k8s-results.json
       - name: summary
         if: always()
