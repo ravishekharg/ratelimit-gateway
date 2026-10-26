@@ -15,7 +15,30 @@ Each data structure is implemented by hand and tested, because each one solves a
 
 ## Results
 
-_Filled from the CI run._
+Measured in CI on every push (GitHub-hosted `ubuntu-24.04`, results in each run's job summary).
+
+**Correctness under concurrency: the main result**
+
+| Setup | Test | Sent (concurrently) | Allowed | Expected |
+|---|---|---|---|---|
+| Docker Compose: 2 gateway replicas, 3 Redis shards | token bucket, capacity 50 | 200, alternating replicas | **50** | 50 |
+| | sliding window, 30 / 60 s | 90 | **30** | 30 |
+| Kubernetes (kind): 3 gateway pods, 3 Redis pods, load test as an in-cluster Job | token bucket, capacity 50 | 200, spread over the 3 pods | **50** | 50 |
+| | sliding window, 30 / 60 s | 90 | **30** | 30 |
+
+Unknown key → 401, blocked key → 403 (Bloom filter + exact check), in both setups.
+
+**Consistent hashing:** 1,000 API keys over 3 Redis shards landed as 344 / 294 / 362 (max/mean 1.09). In the unit
+tests, adding a 4th shard moves about 25% of keys (ideal 1/4), all of them to the new shard; `hash % n` would move
+about 75%.
+
+**Data structures:** the LRU passes a stateful property test against a reference model; the Bloom filter (1%
+target) measured < 2% false positives on 100,000 non-members with zero false negatives.
+
+**Latency (indicative only):** one single-worker uvicorn gateway on a shared 4-vCPU CI runner that also runs the
+load generator, the upstream and 3 Redis servers, at 50 concurrent requests: median 231–252 ms through the
+gateway vs 101–110 ms direct, 139–146 req/s. These are not production numbers. The fixed cost per request is one
+LRU lookup, one Bloom check and one Redis round trip; scaling is horizontal (HPA), because state lives in Redis.
 
 ## Request path
 
