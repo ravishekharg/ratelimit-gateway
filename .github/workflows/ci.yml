@@ -119,7 +119,7 @@ jobs:
         if: always()
         run: python scripts/summary.py k8s-results.json "Kubernetes (kind, 3 gateway pods, 3 Redis shards)" >> "$GITHUB_STEP_SUMMARY"
       - if: failure()
-        run: kubectl -n ratelimit logs deploy/gateway --tail 100 --all-containers
+        run: kubectl -n ratelimit logs -l app=gateway --prefix --tail 200 --all-containers
 
   iac:
     name: terraform + manifests

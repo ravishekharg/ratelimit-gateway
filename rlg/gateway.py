@@ -70,7 +70,32 @@ class State:
         self.cache: LRUCache[str, str] = LRUCache(capacity=10_000, ttl=30)
         self.bloom = BloomFilter(100_000, 0.001)
         self.http = httpx.AsyncClient(base_url=os.environ.get("UPSTREAM_URL", "http://localhost:5678"), timeout=10)
+        self.lookups: dict[str, asyncio.Future] = {}
         self.configure_degraded(os.environ.get("FAIL_MODE", "local"), int(os.environ.get("GATEWAY_REPLICAS", "1")))
+
+    async def plan_for(self, key: str) -> str | None:
+        """API key -> plan, through the LRU cache. Concurrent misses for the same key share one Redis call
+        (single flight): a burst for a key no replica has cached yet must not become a burst on Redis."""
+        plan = self.cache.get(key)
+        if plan is not None:
+            return plan
+        pending = self.lookups.get(key)
+        if pending is not None:
+            return await asyncio.shield(pending)
+        fut = asyncio.get_running_loop().create_future()
+        self.lookups[key] = fut
+        try:
+            plan = await self.meta.hget("api_keys", key)
+            if plan:
+                self.cache.put(key, plan)
+            fut.set_result(plan)
+            return plan
+        except BaseException as e:
+            fut.set_exception(e)
+            fut.exception()                     # mark retrieved: waiters re-raise it, no "never retrieved" warning
+            raise
+        finally:
+            del self.lookups[key]
 
     def configure_degraded(self, mode: str, replicas: int) -> None:
         if mode not in FAIL_MODES or replicas < 1:
@@ -132,12 +157,10 @@ def create_app() -> FastAPI:
     async def proxy(path: str, request: Request) -> Response:
         t0 = time.perf_counter()
         key = request.headers.get("x-api-key", "")
-        plan_name = st.cache.get(key) if key else None
+        plan_name = None
         try:
-            if key and plan_name is None:
-                plan_name = await st.meta.hget("api_keys", key)
-                if plan_name:
-                    st.cache.put(key, plan_name)
+            if key:
+                plan_name = await st.plan_for(key)
             if plan_name and key in st.bloom and await st.meta.sismember("blocked_keys", key):
                 REQUESTS.labels("blocked").inc()
                 return Response('{"error":"API key blocked"}', 403, media_type="application/json")

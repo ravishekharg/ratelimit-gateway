@@ -74,6 +74,11 @@ stateDiagram-v2
 - **Authentication never degrades to "allow":** if the first shard (keys and blocklist) is down, cached keys keep working, and unknown keys get 503 in every mode.
 - **Liveness doesn't depend on Redis.** A liveness probe that pings Redis would restart every gateway pod during a shard outage, turning a partial outage into a total one. `/healthz` reports the breaker states without failing.
 - **The timeout must sit above the backend's p99 under load.** The first kind run used a 250 ms client timeout. A 200-request burst on a busy CI runner pushed some Redis calls past it, the breakers opened although every shard was healthy, and the pods fell back to their local shares: 101 requests admitted against a limit of 50. A false trip in a breaker is an outage of its own, so the default is now 1 s: still bounded, still far below an OS-level TCP timeout, but above the latency the shards show under that burst. The rule is to set the timeout from the measured p99, and alert on breaker trips (`gateway_shard_circuit_open`) so a false trip is seen.
+- **A cache miss must not become a stampede.** Raising the timeout alone didn't fix the kind run (84 admitted against 50). The burst was 200 concurrent requests for a key that none of the 3 pods had cached yet, so every request did its own `HGET` for the plan, and each opened a new connection: a connection storm on the shards, timeouts, open breakers, local decisions. Two fixes:
+  - **single flight**: concurrent misses for the same key wait on one shared lookup (`State.plan_for`; a test checks 100 concurrent misses make 1 Redis call);
+  - **a bounded, blocking pool per shard** (`REDIS_POOL_SIZE`, default 32): bursts queue for a connection instead of opening hundreds.
+
+  Breaker trips and recoveries are now logged, so the next false trip is visible in the pod logs, not only in the numbers.
 - **After recovery:** a restarted shard comes back empty (counters aren't persisted), so its keys get a fresh bucket. That's the right trade-off for rate limits: counters are short-lived, and persisting them would cost write latency on every request.
 
 ## 6. Deployment

@@ -53,6 +53,7 @@ def app(shards, monkeypatch):
                 "pro": {"algo": "sliding_window", "limit": 5, "window": 60}}
     st.cache = gateway.LRUCache(100, ttl=30)
     st.bloom = gateway.BloomFilter(1000, 0.001)
+    st.lookups = {}
 
     def upstream(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"path": request.url.path, "q": request.url.query.decode()})

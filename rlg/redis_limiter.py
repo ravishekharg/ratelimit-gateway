@@ -10,6 +10,7 @@ Each shard has a circuit breaker (breaker.py). A call to a shard whose breaker i
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import redis.asyncio as aioredis
@@ -18,6 +19,8 @@ from redis.exceptions import RedisError
 from rlg.breaker import CircuitBreaker
 from rlg.hashring import HashRing
 from rlg.limiters import Decision
+
+log = logging.getLogger("rlg")
 
 TOKEN_BUCKET = """
 local key = KEYS[1]
@@ -89,8 +92,13 @@ class RedisLimiter:
         timeout = float(os.environ.get("REDIS_TIMEOUT", "1.0"))
         threshold = int(os.environ.get("BREAKER_THRESHOLD", "3"))
         reset = float(os.environ.get("BREAKER_RESET_SECONDS", "5"))
-        clients = {u: aioredis.from_url(u, decode_responses=True, socket_timeout=timeout,
-                                        socket_connect_timeout=timeout) for u in urls}
+        # a bounded, blocking pool per shard: a burst queues for a connection (up to POOL_WAIT_SECONDS) instead of
+        # opening hundreds of new connections at once, which is what made calls time out under load
+        size = int(os.environ.get("REDIS_POOL_SIZE", "32"))
+        wait = float(os.environ.get("POOL_WAIT_SECONDS", "5"))
+        clients = {u: aioredis.Redis(connection_pool=aioredis.BlockingConnectionPool.from_url(
+            u, decode_responses=True, socket_timeout=timeout, socket_connect_timeout=timeout,
+            max_connections=size, timeout=wait)) for u in urls}
         return cls(clients, breakers={u: CircuitBreaker(threshold, reset) for u in urls})
 
     def shard_for(self, key: str) -> str:
@@ -101,12 +109,19 @@ class RedisLimiter:
         breaker = self.breakers[shard]
         if not breaker.allow():
             raise ShardUnavailable(shard, "circuit open")
+        probing = breaker.opened_at is not None
         try:
             allowed, remaining, retry = await scripts[shard](keys=[f"{prefix}:{key}"], args=args)
         except (RedisError, OSError) as e:
+            was_open = breaker.opened_at is not None
             breaker.failure()
+            if not was_open and breaker.opened_at is not None:
+                log.warning("circuit OPEN for %s after %d failures (last: %s: %s)", shard, breaker.threshold,
+                            type(e).__name__, e)
             raise ShardUnavailable(shard, type(e).__name__) from e
         breaker.success()
+        if probing:
+            log.warning("circuit CLOSED for %s: probe succeeded", shard)
         return Decision(bool(int(allowed)), int(remaining), float(retry))
 
     async def token_bucket(self, key: str, capacity: int, rate: float, cost: int = 1) -> Decision:

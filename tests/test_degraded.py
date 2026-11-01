@@ -94,6 +94,7 @@ def make_app(mode: str, replicas: int = 2):
                 "pro": {"algo": "sliding_window", "limit": 6, "window": 60}}
     st.cache = gateway.LRUCache(100, ttl=30)
     st.bloom = gateway.BloomFilter(1000, 0.001)
+    st.lookups = {}
     st.http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, text="ok")),
                                 base_url="http://up")
     st.configure_degraded(mode, replicas)
@@ -177,3 +178,36 @@ def test_invalid_fail_mode_is_rejected():
     st = make_app("local")
     with pytest.raises(ValueError):
         st.configure_degraded("sometimes", 1)
+
+
+def test_concurrent_cache_misses_share_one_redis_lookup():
+    st = make_app("local")
+
+    async def run():
+        await st.meta.hset("api_keys", mapping={"burst": "free"})
+        calls = []
+        real = st.meta.hget
+
+        async def counting(*a, **k):
+            calls.append(1)
+            await asyncio.sleep(0.05)              # a slow lookup: everyone else arrives while it's in flight
+            return await real(*a, **k)
+        st.meta.hget = counting
+        plans = await asyncio.gather(*(st.plan_for("burst") for _ in range(100)))
+        return plans, len(calls)
+    plans, calls = asyncio.run(run())
+    assert plans == ["free"] * 100 and calls == 1
+
+
+def test_a_failed_shared_lookup_fails_every_waiter_and_is_retried():
+    st = make_app("local")
+
+    async def run():
+        async def boom(*_a, **_k):
+            await asyncio.sleep(0.01)
+            raise RedisConnectionError("down")
+        st.meta.hget = boom
+        res = await asyncio.gather(*(st.plan_for("k") for _ in range(10)), return_exceptions=True)
+        return res, st.lookups
+    res, pending = asyncio.run(run())
+    assert all(isinstance(r, RedisConnectionError) for r in res) and pending == {}   # nothing left stuck
