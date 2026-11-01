@@ -57,6 +57,15 @@ async def main(a) -> dict:
     shards = [aioredis.from_url(u, decode_responses=True) for u in a.redis.split(",")]
     meta = shards[0]
     for s in shards:
+        # a pod's DNS name can lag its readiness by a few seconds (in-cluster runs start right after rollout)
+        for attempt in range(60):
+            try:
+                await s.ping()
+                break
+            except (aioredis.ConnectionError, OSError):
+                if attempt == 59:
+                    raise
+                await asyncio.sleep(1)
         await s.flushall()
     perf_keys = [f"perf-{i}" for i in range(1000)]
     await meta.hset("api_keys", mapping={"burst-key": "burst", "window-key": "window", "bad-key": "free",
