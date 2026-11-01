@@ -4,11 +4,18 @@ Each check is ONE Lua script, executed atomically by Redis, so concurrent reques
 never both take the last token (no read-modify-write race). The script reads the clock with redis.call('TIME'),
 so replicas with skewed clocks still agree. Keys are spread over several standalone Redis shards with the
 consistent-hash ring (hashring.py); with Redis Cluster you would use hash tags instead.
+
+Each shard has a circuit breaker (breaker.py). A call to a shard whose breaker is open, or a call that fails
+(connection error, timeout), raises ShardUnavailable at once; the gateway then applies its degraded-mode policy.
 """
 from __future__ import annotations
 
-import redis.asyncio as aioredis
+import os
 
+import redis.asyncio as aioredis
+from redis.exceptions import RedisError
+
+from rlg.breaker import CircuitBreaker
 from rlg.hashring import HashRing
 from rlg.limiters import Decision
 
@@ -61,29 +68,52 @@ return {0, 0, tostring((idx + 1) * window - now)}
 """
 
 
+class ShardUnavailable(Exception):
+    def __init__(self, shard: str, reason: str) -> None:
+        self.shard = shard
+        super().__init__(f"{shard}: {reason}")
+
+
 class RedisLimiter:
-    def __init__(self, shards: dict[str, aioredis.Redis], vnodes: int = 160) -> None:
+    def __init__(self, shards: dict[str, aioredis.Redis], vnodes: int = 160,
+                 breakers: dict[str, CircuitBreaker] | None = None) -> None:
         self.shards = shards
         self.ring = HashRing(list(shards), vnodes)
+        self.breakers = breakers or {name: CircuitBreaker() for name in shards}
         self._tb = {name: r.register_script(TOKEN_BUCKET) for name, r in shards.items()}
         self._sw = {name: r.register_script(SLIDING_WINDOW) for name, r in shards.items()}
 
     @classmethod
     def from_urls(cls, urls: list[str]) -> RedisLimiter:
-        return cls({u: aioredis.from_url(u, decode_responses=True) for u in urls})
+        # short timeouts: a rate-limit check that waits seconds for a dead shard is worse than a degraded answer
+        timeout = float(os.environ.get("REDIS_TIMEOUT", "0.25"))
+        threshold = int(os.environ.get("BREAKER_THRESHOLD", "3"))
+        reset = float(os.environ.get("BREAKER_RESET_SECONDS", "5"))
+        clients = {u: aioredis.from_url(u, decode_responses=True, socket_timeout=timeout,
+                                        socket_connect_timeout=timeout) for u in urls}
+        return cls(clients, breakers={u: CircuitBreaker(threshold, reset) for u in urls})
 
     def shard_for(self, key: str) -> str:
         return self.ring.get(key)
 
-    async def token_bucket(self, key: str, capacity: int, rate: float, cost: int = 1) -> Decision:
+    async def _run(self, scripts: dict, prefix: str, key: str, args: list) -> Decision:
         shard = self.shard_for(key)
-        allowed, remaining, retry = await self._tb[shard](keys=[f"tb:{key}"], args=[capacity, rate, cost])
+        breaker = self.breakers[shard]
+        if not breaker.allow():
+            raise ShardUnavailable(shard, "circuit open")
+        try:
+            allowed, remaining, retry = await scripts[shard](keys=[f"{prefix}:{key}"], args=args)
+        except (RedisError, OSError) as e:
+            breaker.failure()
+            raise ShardUnavailable(shard, type(e).__name__) from e
+        breaker.success()
         return Decision(bool(int(allowed)), int(remaining), float(retry))
 
+    async def token_bucket(self, key: str, capacity: int, rate: float, cost: int = 1) -> Decision:
+        return await self._run(self._tb, "tb", key, [capacity, rate, cost])
+
     async def sliding_window(self, key: str, limit: int, window: float) -> Decision:
-        shard = self.shard_for(key)
-        allowed, remaining, retry = await self._sw[shard](keys=[f"sw:{key}"], args=[limit, window])
-        return Decision(bool(int(allowed)), int(remaining), float(retry))
+        return await self._run(self._sw, "sw", key, [limit, window])
 
     async def close(self) -> None:
         for r in self.shards.values():

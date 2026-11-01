@@ -6,6 +6,22 @@ import json
 import os
 import sys
 
+if sys.argv[1] == "--chaos":
+    if not os.path.exists(sys.argv[2]):
+        print("## Chaos: no results")
+        raise SystemExit(0)
+    r = json.load(open(sys.argv[2]))
+    print(f"## Chaos (one Redis shard stopped during traffic): {'PASSED' if r['passed'] else 'FAILED'}\n")
+    print("| phase | sent | allowed | limited | marked degraded | p50 ms |\n|---|---|---|---|---|---|")
+    for name, k in (("key on the stopped shard", "victim_shard_down"), ("key on a healthy shard, meanwhile",
+                     "healthy_shard_meanwhile"), ("same shard after it came back", "victim_shard_back")):
+        x = r[k]
+        print(f"| {name} | {x['sent']} | {x['allowed']} | {x['limited']} | {x['degraded']} | {x['p50_ms']} |")
+    print("\n| check | result |\n|---|---|")
+    for k, v in r["checks"].items():
+        print(f"| {k} | {'pass' if v else 'FAIL'} |")
+    raise SystemExit(0)
+
 path, title = sys.argv[1], sys.argv[2]
 if not os.path.exists(path):
     print(f"## {title}: no results")

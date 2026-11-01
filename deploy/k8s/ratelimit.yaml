@@ -13,6 +13,11 @@ metadata:
 data:
   UPSTREAM_URL: http://upstream.ratelimit.svc:5678
   REDIS_URLS: redis://redis-0.redis.ratelimit.svc:6379,redis://redis-1.redis.ratelimit.svc:6379,redis://redis-2.redis.ratelimit.svc:6379
+  # a dead shard: each pod enforces limit / GATEWAY_REPLICAS locally. Set it to the HPA's minReplicas: with more
+  # pods running, the fleet can admit up to (pods / minReplicas) x the limit during the outage, never less
+  FAIL_MODE: local
+  GATEWAY_REPLICAS: "3"
+  BREAKER_RESET_SECONDS: "5"
   PLANS: |
     {"free": {"algo": "token_bucket", "capacity": 10, "rate": 1},
      "pro": {"algo": "sliding_window", "limit": 600, "window": 60},

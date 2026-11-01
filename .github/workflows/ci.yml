@@ -35,14 +35,18 @@ jobs:
       - run: pip install -e .
       - run: docker compose up -d --build --wait
       - run: python scripts/loadtest.py --requests 5000 --concurrency 50 --out results.json
+      - name: chaos (stop one Redis shard during traffic, then bring it back)
+        run: python scripts/chaos.py --out chaos.json
       - name: summary
         if: always()
-        run: python scripts/summary.py results.json "Docker Compose" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          python scripts/summary.py results.json "Docker Compose" >> "$GITHUB_STEP_SUMMARY"
+          python scripts/summary.py --chaos chaos.json >> "$GITHUB_STEP_SUMMARY"
       - if: failure()
         run: docker compose logs --tail 100
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: compose-results, path: results.json }
+        with: { name: compose-results, path: "results.json\nchaos.json" }
 
   kind:
     name: deploy to Kubernetes (kind) + exactness across pods

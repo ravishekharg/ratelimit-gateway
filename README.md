@@ -40,6 +40,27 @@ load generator, the upstream and 3 Redis servers, at 50 concurrent requests: med
 gateway vs 101–110 ms direct, 139–146 req/s. These are not production numbers. The fixed cost per request is one
 LRU lookup, one Bloom check and one Redis round trip; scaling is horizontal (HPA), because state lives in Redis.
 
+## Degraded mode: when a Redis shard dies
+
+Each shard has a **circuit breaker**: after 3 consecutive failures (connection error or 250 ms timeout) the shard
+counts as down and requests for its keys skip it at once; after 5 s one request probes it, and a success closes
+the breaker. What happens to the keys on a down shard is a policy, `FAIL_MODE`:
+
+| `FAIL_MODE` | Keys on the dead shard | Choose it when |
+|---|---|---|
+| `local` (default) | Each replica enforces the plan in process at limit / `GATEWAY_REPLICAS`, so the fleet still admits about the plan's limit; responses carry `X-RateLimit-Degraded: local` | You want both: keep serving, keep abuse protection (approximate during the outage) |
+| `open` | Allowed, marked `X-RateLimit-Degraded: open` | Availability matters more than limits (internal traffic) |
+| `closed` | `503` + `Retry-After: 5` | The limit protects something that must not be overrun (a paid partner API, a fragile backend) |
+
+Keys on healthy shards are unaffected and stay exact. If the first shard (keys and blocklist) is down, keys the
+replica has already seen keep working from the LRU cache; an unknown key gets `503`, never a free pass, in every
+mode. `/healthz` reports each shard's breaker state but doesn't fail, so liveness never depends on Redis.
+
+`scripts/chaos.py` proves it on the compose stack in CI: it stops `redis-2` during traffic, checks the keys on it
+(still served, every response marked degraded, the two replicas together admitting at most the plan's 20,
+decisions fast because the breaker is open), checks a key on a healthy shard (exact, unmarked), then restarts the
+shard and checks it is exact again and the breaker closed.
+
 ## Request path
 
 ```mermaid
@@ -92,6 +113,7 @@ flowchart LR
 pip install -e ".[dev]" && pytest -q              # unit, property and stateful tests (no Docker needed)
 docker compose up -d --build --wait
 python scripts/loadtest.py                        # exactness, auth, latency, shard balance
+python scripts/chaos.py                           # stop a Redis shard mid-traffic, then bring it back
 ```
 
 ## Design notes (interview talking points)
@@ -103,5 +125,7 @@ python scripts/loadtest.py                        # exactness, auth, latency, sh
   limits; the ring moves about 25%, and only to the new shard (tested).
 - **Why a Bloom filter in front of Redis?** Almost no request uses a blocked key; the filter answers "definitely not
   blocked" locally. False positives only cost one extra Redis call, and there are no false negatives.
-- **Failure mode:** if Redis is unreachable the gateway returns an error (fail closed). Fail-open with a local
-  token bucket is a one-line policy change, and a trade-off to discuss: availability vs abuse protection.
+- **What happens when a Redis shard dies?** See "Degraded mode" above. A circuit breaker per shard makes the outage
+  cheap (no socket timeout on every request), `FAIL_MODE` makes the availability vs abuse-protection trade-off
+  explicit, and liveness doesn't depend on Redis, so Kubernetes never restarts every gateway because one shard is
+  down. Design details: [`docs/architecture.md`](docs/architecture.md).

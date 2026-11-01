@@ -6,7 +6,8 @@ x-plans: &plans >-
    "pro": {"algo": "sliding_window", "limit": 600, "window": 60},
    "burst": {"algo": "token_bucket", "capacity": 50, "rate": 0.01},
    "window": {"algo": "sliding_window", "limit": 30, "window": 60},
-   "perf": {"algo": "token_bucket", "capacity": 1000000, "rate": 1000}}
+   "perf": {"algo": "token_bucket", "capacity": 1000000, "rate": 1000},
+   "chaos": {"algo": "token_bucket", "capacity": 20, "rate": 0.01}}
 
 x-gateway: &gateway
   build: .
@@ -15,6 +16,9 @@ x-gateway: &gateway
     UPSTREAM_URL: http://upstream:5678
     REDIS_URLS: redis://redis-0:6379,redis://redis-1:6379,redis://redis-2:6379
     PLANS: *plans
+    FAIL_MODE: local              # a dead shard: enforce limit / GATEWAY_REPLICAS in each replica
+    GATEWAY_REPLICAS: "2"
+    BREAKER_RESET_SECONDS: "5"
   depends_on:
     redis-0: { condition: service_healthy }
     redis-1: { condition: service_healthy }
