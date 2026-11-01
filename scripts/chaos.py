@@ -57,7 +57,7 @@ def compose(*args: str) -> None:
 async def main(a) -> dict:
     gws = a.gateways.split(",")
     ring = HashRing(GATEWAY_RING)
-    victim_keys = keys_on(ring, VICTIM, 3, "chaos-dead")
+    victim_keys = keys_on(ring, VICTIM, 4, "chaos-dead")
     healthy_key = keys_on(ring, HEALTHY, 1, "chaos-live")[0]
     meta = aioredis.from_url(a.meta, decode_responses=True)
     await meta.hset("api_keys", mapping=dict.fromkeys([*victim_keys, healthy_key], "chaos"))
@@ -66,7 +66,7 @@ async def main(a) -> dict:
     out: dict = {}
     async with httpx.AsyncClient(timeout=10) as c:
         # warm the gateways' key caches so the outage only affects rate-limit state
-        for k in [*victim_keys, healthy_key]:
+        for k in [*victim_keys[:3], healthy_key]:
             for g in gws:
                 await c.get(f"{g}/api/x", headers={"x-api-key": k})
         compose("stop", "redis-2")
@@ -77,9 +77,17 @@ async def main(a) -> dict:
         out["breaker_state_while_down"] = health["shards"].get(VICTIM)
         compose("start", "redis-2")
         compose("up", "-d", "--wait", "redis-2")
-        await asyncio.sleep(a.reset + 1)                                    # breaker reset time, then a probe
-        await burst(c, gws, victim_keys[2], 2)                               # probes close the breakers
-        out["victim_shard_back"] = await burst(c, gws, victim_keys[2], 60)
+        await asyncio.sleep(a.reset + 1)                                    # breaker reset time
+        # probe until every replica's breaker has closed. The first call after the restart can hit a pooled
+        # connection the old server closed, which re-opens the breaker once more: that's correct behaviour, so
+        # keep probing (on a key of its own) rather than assuming one probe per replica is enough
+        for _ in range(30):
+            await burst(c, gws, victim_keys[2], len(gws))
+            states = [(await c.get(f"{g}/healthz")).json()["shards"].get(VICTIM) for g in gws]
+            if all(s == "closed" for s in states):
+                break
+            await asyncio.sleep(1)
+        out["victim_shard_back"] = await burst(c, gws, victim_keys[3], 60)  # a fresh key on the restarted shard
         out["breaker_state_after"] = (await c.get(f"{gws[0]}/healthz")).json()["shards"].get(VICTIM)
 
     down, live, back = out["victim_shard_down"], out["healthy_shard_meanwhile"], out["victim_shard_back"]
@@ -91,8 +99,8 @@ async def main(a) -> dict:
         # 2 of its 20 tokens went on warming the caches, so exactly 18 of the burst may pass
         "healthy shard stays exact (18 of 60) and unmarked": live["allowed"] == 18 and live["degraded"] == 0,
         "breaker was open while the shard was down": out["breaker_state_while_down"] == "open",
-        # the restarted shard starts empty (no persistence): 20 tokens, 2 spent on the probes
-        "after recovery the shard is exact again (18 of 60)": back["allowed"] == 18
+        # a key never used before, on the restarted shard: its full 20 tokens, decided by Redis again
+        "after recovery the shard is exact again (20 of 60)": back["allowed"] == 20
         and back["degraded"] == 0,
         "breaker closed after recovery": out["breaker_state_after"] == "closed",
     }
