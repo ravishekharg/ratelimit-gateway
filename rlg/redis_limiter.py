@@ -86,7 +86,7 @@ class RedisLimiter:
     @classmethod
     def from_urls(cls, urls: list[str]) -> RedisLimiter:
         # short timeouts: a rate-limit check that waits seconds for a dead shard is worse than a degraded answer
-        timeout = float(os.environ.get("REDIS_TIMEOUT", "0.25"))
+        timeout = float(os.environ.get("REDIS_TIMEOUT", "1.0"))
         threshold = int(os.environ.get("BREAKER_THRESHOLD", "3"))
         reset = float(os.environ.get("BREAKER_RESET_SECONDS", "5"))
         clients = {u: aioredis.from_url(u, decode_responses=True, socket_timeout=timeout,

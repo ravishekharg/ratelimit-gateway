@@ -64,7 +64,7 @@ stateDiagram-v2
   HalfOpen --> Open: probe fails
 ```
 
-- **The breaker** stops every request from waiting out the socket timeout (250 ms) on a dead shard, which would otherwise pile up connections on every replica. While it's open, the decision is instant. While it's half-open, exactly one probe goes through and everyone else stays degraded.
+- **The breaker** stops every request from waiting out the OS socket timeout on a dead shard (or the 1 s client timeout), which would otherwise pile up connections on every replica. While it's open, the decision is instant. While it's half-open, exactly one probe goes through and everyone else stays degraded.
 - **The policy** (`FAIL_MODE`) is a product decision made explicit:
   - `local`: each replica enforces `ceil(limit / GATEWAY_REPLICAS)` in process.
   - `open`: allow everything.
@@ -73,6 +73,7 @@ stateDiagram-v2
 - **Why `local` is approximate:** each replica sees only its own share of traffic. If traffic is spread evenly over N replicas, the fleet admits about the limit. If the load balancer sends one client's traffic mostly to one replica, that client gets less. If more replicas run than `GATEWAY_REPLICAS` says, the fleet admits more. Set it to the HPA's `minReplicas` and accept bounded over-admission for the duration of the outage. Even under this approximation, the abuse protection still holds.
 - **Authentication never degrades to "allow":** if the first shard (keys and blocklist) is down, cached keys keep working, and unknown keys get 503 in every mode.
 - **Liveness doesn't depend on Redis.** A liveness probe that pings Redis would restart every gateway pod during a shard outage, turning a partial outage into a total one. `/healthz` reports the breaker states without failing.
+- **The timeout must sit above the backend's p99 under load.** The first kind run used a 250 ms client timeout. A 200-request burst on a busy CI runner pushed some Redis calls past it, the breakers opened although every shard was healthy, and the pods fell back to their local shares: 101 requests admitted against a limit of 50. A false trip in a breaker is an outage of its own, so the default is now 1 s: still bounded, still far below an OS-level TCP timeout, but above the latency the shards show under that burst. The rule is to set the timeout from the measured p99, and alert on breaker trips (`gateway_shard_circuit_open`) so a false trip is seen.
 - **After recovery:** a restarted shard comes back empty (counters aren't persisted), so its keys get a fresh bucket. That's the right trade-off for rate limits: counters are short-lived, and persisting them would cost write latency on every request.
 
 ## 6. Deployment

@@ -42,7 +42,7 @@ LRU lookup, one Bloom check and one Redis round trip; scaling is horizontal (HPA
 
 ## Degraded mode: when a Redis shard dies
 
-Each shard has a **circuit breaker**: after 3 consecutive failures (connection error or 250 ms timeout) the shard
+Each shard has a **circuit breaker**: after 3 consecutive failures (connection error or 1 s timeout) the shard
 counts as down and requests for its keys skip it at once; after 5 s one request probes it, and a success closes
 the breaker. What happens to the keys on a down shard is a policy, `FAIL_MODE`:
 
